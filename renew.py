@@ -28,32 +28,38 @@ def send_tg(msg):
         print(f"[!] TG 通知发送失败: {e}")
 
 
-def handle_global_cf_page(page, timeout=20):
-    """处理初次打开网址时遇到的全屏 Cloudflare 验证页"""
+def handle_global_cf_page(page, timeout=30):
+    """处理初次打开网址时遇到的全屏 Cloudflare 验证页并等待跳转"""
     print("[*] 检查是否存在全屏 Cloudflare 验证拦截页...")
     start_time = time.time()
+    
     while time.time() - start_time < timeout:
         try:
-            # 检查页面标题或文本是否包含安全验证
-            if "security verification" in page.html.lower() or "verify you are human" in page.html.lower():
-                print("[*] 遇到全屏 Cloudflare 验证页，正在尝试点击验证框...")
-                # 寻找 iframe 或 checkbox 坐标
-                iframe = page.ele('xpath://iframe[contains(@src, "cloudflare") or contains(@src, "turnstile")]', timeout=2)
-                if iframe:
-                    rect = iframe.rect
-                    x, y = rect.location[0] + 30, rect.location[1] + rect.size[1] / 2
-                    page.actions.move_to((int(x), int(y))).click()
-                else:
-                    # 兜底：直接在页面中心偏左位置点击常见复选框区域
-                    page.actions.move_to((270, 370)).click()
-                time.sleep(4)
-            else:
-                # 已经离开拦截页，进入正常登录页
-                print("[+] 已成功通过或未遇到全屏 Cloudflare 拦截页。")
+            html = page.html.lower()
+            # 如果不包含安全验证特征，说明已经成功进入正常登录页
+            if "security verification" not in html and "verify you are human" not in html:
+                print("[+] 已成功进入登录页页面。")
                 return True
-        except Exception:
-            pass
-        time.sleep(2)
+
+            print("[*] 遇到全屏 Cloudflare 验证页，正在尝试点击验证框...")
+            iframe = page.ele('xpath://iframe[contains(@src, "cloudflare") or contains(@src, "turnstile")]', timeout=2)
+            if iframe:
+                rect = iframe.rect
+                x, y = rect.location[0] + 30, rect.location[1] + rect.size[1] / 2
+                page.actions.move_to((int(x), int(y))).click()
+            else:
+                # 兜底坐标点击
+                page.actions.move_to((270, 370)).click()
+            
+            # 点击后必须等待几秒让 Cloudflare 完成校验并自动刷新跳转
+            print("[*] 已点击验证框，等待页面跳转刷新...")
+            time.sleep(6)
+            
+        except Exception as e:
+            print(f"[!] 验证页处理过程异常: {e}")
+            time.sleep(2)
+
+    print("[!] 全屏 Cloudflare 验证等待超时...")
     return False
 
 
@@ -197,10 +203,10 @@ def main():
         # ==================== 打开登录页并处理全局 CF 拦截页 ====================
         print(f"[*] 正在打开登录页: {LOGIN_URL}")
         page.get(LOGIN_URL)
-        time.sleep(5)
+        time.sleep(3)
 
-        # 自动处理可能出现的全局安全验证页
-        handle_global_cf_page(page, timeout=25)
+        # 自动处理可能出现的全局安全验证页并等待跳转
+        handle_global_cf_page(page, timeout=35)
         time.sleep(3)
 
         # ==================== 第一步：输入账号 + CF验证 + 点击继续 ====================
