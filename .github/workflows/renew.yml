@@ -2,10 +2,9 @@ name: AcoreHosting Auto Renew
 
 on:
   schedule:
-    # 每 48 小时（每隔 2 天的 UTC 00:00）运行一次
-    # 注：由于免费服通常每 24h 开放续期、48h 满期停机，若担心卡点超时，建议改为 '0 */12 * * *' (每12小时检查一次)
+    # 每 48 小时运行一次（如需更稳妥建议改为 '0 */12 * * *' 每12小时检查一次）
     - cron: '0 0 */2 * *'
-  workflow_dispatch: # 支持在 GitHub 页面手动点击触发测试
+  workflow_dispatch:
 
 jobs:
   renew:
@@ -29,7 +28,7 @@ jobs:
       - name: 4. 安装系统依赖 (Chrome & Xvfb 虚拟显示器)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb xdotool wget curl unzip libxi6 libgconf-2-4 libnss3
+          sudo apt-get install -y xvfb xdotool wget curl unzip libxi6 libnss3
           pip install --upgrade pip
           pip install -r requirements.txt
 
