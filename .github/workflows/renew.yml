@@ -1,0 +1,53 @@
+name: AcoreHosting Auto Renew
+
+on:
+  schedule:
+    # 每 48 小时（每隔 2 天的 UTC 00:00）运行一次
+    # 注：由于免费服通常每 24h 开放续期、48h 满期停机，若担心卡点超时，建议改为 '0 */12 * * *' (每12小时检查一次)
+    - cron: '0 0 */2 * *'
+  workflow_dispatch: # 支持在 GitHub 页面手动点击触发测试
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 1. 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 同步系统时钟 (防止时间偏移导致验证失败)
+        run: |
+          sudo timedatectl set-ntp true
+          date
+
+      - name: 3. 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 4. 安装系统依赖 (Chrome & Xvfb 虚拟显示器)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool wget curl unzip libxi6 libgconf-2-4 libnss3
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 5. 运行自动续期脚本
+        env:
+          ACORE_EMAIL: ${{ secrets.ACORE_EMAIL }}
+          ACORE_PASSWORD: ${{ secrets.ACORE_PASSWORD }}
+          ACORE_SERVER_ID: ${{ secrets.ACORE_SERVER_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
+
+      - name: 6. 上传运行截图 (用于排错检查)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 5
