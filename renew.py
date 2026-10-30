@@ -9,7 +9,7 @@ from proxy_helper import start_proxy
 EMAIL = os.environ.get("ACORE_EMAIL", "").strip()
 PASSWORD = os.environ.get("ACORE_PASSWORD", "").strip()
 SERVER_ID = os.environ.get("ACORE_SERVER_ID", "").strip()
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()  # 支持 vless://, vmess://, hy2://, trojan://, socks5://, http://
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
@@ -26,6 +26,35 @@ def send_tg(msg):
         requests.post(url, json={"chat_id": TG_CHAT_ID, "text": f"【AcoreHosting 续期】\n{msg}"}, timeout=10)
     except Exception as e:
         print(f"[!] TG 通知发送失败: {e}")
+
+
+def handle_global_cf_page(page, timeout=20):
+    """处理初次打开网址时遇到的全屏 Cloudflare 验证页"""
+    print("[*] 检查是否存在全屏 Cloudflare 验证拦截页...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            # 检查页面标题或文本是否包含安全验证
+            if "security verification" in page.html.lower() or "verify you are human" in page.html.lower():
+                print("[*] 遇到全屏 Cloudflare 验证页，正在尝试点击验证框...")
+                # 寻找 iframe 或 checkbox 坐标
+                iframe = page.ele('xpath://iframe[contains(@src, "cloudflare") or contains(@src, "turnstile")]', timeout=2)
+                if iframe:
+                    rect = iframe.rect
+                    x, y = rect.location[0] + 30, rect.location[1] + rect.size[1] / 2
+                    page.actions.move_to((int(x), int(y))).click()
+                else:
+                    # 兜底：直接在页面中心偏左位置点击常见复选框区域
+                    page.actions.move_to((270, 370)).click()
+                time.sleep(4)
+            else:
+                # 已经离开拦截页，进入正常登录页
+                print("[+] 已成功通过或未遇到全屏 Cloudflare 拦截页。")
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
 
 
 def is_cf_passed(page):
@@ -71,7 +100,6 @@ def click_turnstile_box(page, stage_name="", btn_keywords=None, timeout=30):
 
         clicked = False
 
-        # 1. 选择器定位
         try:
             targets = [
                 'xpath://iframe[contains(@src, "cloudflare") or contains(@src, "turnstile")]',
@@ -92,7 +120,6 @@ def click_turnstile_box(page, stage_name="", btn_keywords=None, timeout=30):
         except Exception:
             pass
 
-        # 2. JS 尺寸特征探测
         if not clicked:
             try:
                 coords = page.run_js('''
@@ -107,16 +134,14 @@ def click_turnstile_box(page, stage_name="", btn_keywords=None, timeout=30):
                 ''')
                 if coords:
                     x, y = int(coords['x']), int(coords['y'])
-                    print(f"[*] [第{attempt}次] 通过尺寸特征识别验证框 ({coords['w']}x{coords['h']})，点击坐标: ({x}, {y})")
+                    print(f"[*] [第{attempt}次] 通过尺寸特征识别验证框，点击坐标: ({x}, {y})")
                     page.actions.move_to((x, y)).click()
                     clicked = True
             except Exception:
                 pass
 
-        # 3. 键盘 Tab + Space 触发
         if not clicked and attempt % 2 == 0:
             try:
-                print(f"[*] [第{attempt}次] 尝试使用 Tab + Space 键盘导航触发验证框...")
                 page.actions.key_down('Tab').key_up('Tab')
                 time.sleep(0.5)
                 page.actions.key_down('Space').key_up('Space')
@@ -125,8 +150,7 @@ def click_turnstile_box(page, stage_name="", btn_keywords=None, timeout=30):
 
         time.sleep(4)
 
-    print(f"[!] [{stage_name}] Cloudflare 验证等待超时，保存当前页面截图...")
-    page.get_screenshot(path=f"cf_timeout_{stage_name}.png")
+    print(f"[!] [{stage_name}] Cloudflare 验证等待超时...")
     return False
 
 
@@ -154,7 +178,6 @@ def main():
     page = None
 
     try:
-        # 启动代理（如果配置了 PROXY_URL）
         local_proxy, proxy_proc = start_proxy(PROXY_URL)
 
         co = ChromiumOptions()
@@ -171,16 +194,21 @@ def main():
 
         page = ChromiumPage(co)
 
-        # ==================== 第一步：输入账号 + CF验证 + 点击继续 ====================
+        # ==================== 打开登录页并处理全局 CF 拦截页 ====================
         print(f"[*] 正在打开登录页: {LOGIN_URL}")
         page.get(LOGIN_URL)
-        time.sleep(6)
+        time.sleep(5)
 
+        # 自动处理可能出现的全局安全验证页
+        handle_global_cf_page(page, timeout=25)
+        time.sleep(3)
+
+        # ==================== 第一步：输入账号 + CF验证 + 点击继续 ====================
         print("[*] 正在定位并填写账号...")
         email_input = page.ele('css:input[type="text"], input[type="email"], input:not([type="hidden"])', timeout=15)
         if not email_input:
             page.get_screenshot(path="error_no_email_input.png")
-            raise RuntimeError("未找到账号输入框（请检查代理节点是否可用或查看截图 error_no_email_input.png）")
+            raise RuntimeError("未找到账号输入框，请查看截图 error_no_email_input.png")
 
         fill_input_react(page, email_input, EMAIL)
         time.sleep(2)
@@ -203,7 +231,7 @@ def main():
         pwd_input = page.ele('css:input[type="password"]', timeout=20)
         if not pwd_input:
             page.get_screenshot(path="error_step1.png")
-            raise RuntimeError("未能进入密码输入界面，请下载 Artifacts 查看 step1_after_cf.png 和 error_step1.png")
+            raise RuntimeError("未能进入密码输入界面，请查看截图 error_step1.png")
 
         print("[*] 正在填写密码...")
         fill_input_react(page, pwd_input, PASSWORD)
@@ -243,7 +271,7 @@ def main():
                     srv_card.click()
                 else:
                     page.get_screenshot(path="error_server_list.png")
-                    raise RuntimeError("未能在列表中找到服务器，建议在 Secrets 中配置 ACORE_SERVER_ID（值为 1da63f5c）")
+                    raise RuntimeError("未能在列表中找到服务器，建议在 Secrets 中配置 ACORE_SERVER_ID")
 
         time.sleep(6)
         print(f"[*] 已进入服务器控制面板: {page.url}")
@@ -254,7 +282,7 @@ def main():
 
         if not renew_btn:
             page.get_screenshot(path="error_no_renew_btn.png")
-            raise RuntimeError("未在页面上找到 Renew 按钮（已保存截图 error_no_renew_btn.png）")
+            raise RuntimeError("未在页面上找到 Renew 按钮")
 
         status_hint = ""
         hint_ele = page.ele('xpath://*[contains(text(), "Renew available") or contains(text(), "Until suspension")]', timeout=2)
