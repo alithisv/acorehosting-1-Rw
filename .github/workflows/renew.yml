@@ -2,7 +2,6 @@ name: AcoreHosting Auto Renew
 
 on:
   schedule:
-    # 每 48 小时运行一次（如需更稳妥建议改为 '0 */12 * * *' 每12小时检查一次）
     - cron: '0 0 */2 * *'
   workflow_dispatch:
 
@@ -15,7 +14,7 @@ jobs:
       - name: 1. 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 2. 同步系统时钟 (防止时间偏移导致验证失败)
+      - name: 2. 同步系统时钟
         run: |
           sudo timedatectl set-ntp true
           date
@@ -25,10 +24,19 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 4. 安装系统依赖 (Chrome & Xvfb 虚拟显示器)
+      - name: 4. 安装系统依赖与 sing-box 代理核心
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb xdotool wget curl unzip libxi6 libnss3
+          
+          # 安装 sing-box 以支持 vless / vmess / hy2 / trojan 协议
+          SB_VER="1.10.7"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${SB_VER}-linux-amd64.tar.gz"
+          sudo mv "sing-box-${SB_VER}-linux-amd64/sing-box" /usr/local/bin/
+          sudo chmod +x /usr/local/bin/sing-box
+          sing-box version
+
           pip install --upgrade pip
           pip install -r requirements.txt
 
@@ -37,6 +45,7 @@ jobs:
           ACORE_EMAIL: ${{ secrets.ACORE_EMAIL }}
           ACORE_PASSWORD: ${{ secrets.ACORE_PASSWORD }}
           ACORE_SERVER_ID: ${{ secrets.ACORE_SERVER_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
