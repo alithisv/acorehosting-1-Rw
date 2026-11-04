@@ -114,8 +114,38 @@ def xdotool_click(page, client_x, client_y):
         pass
 
 
+def click_element_robust(page, ele):
+    """同时使用 DOM 点击与真实鼠标坐标点击目标元素，确保 React 事件必被触发"""
+    if not ele:
+        return
+    try:
+        ele.scroll.to_see()
+        time.sleep(0.2)
+    except Exception:
+        pass
+
+    try:
+        rect = ele.rect
+        if rect and rect.size[0] > 5 and rect.size[1] > 5:
+            cx = int(rect.location[0] + rect.size[0] / 2)
+            cy = int(rect.location[1] + rect.size[1] / 2)
+            xdotool_click(page, cx, cy)
+            time.sleep(0.3)
+            return
+    except Exception:
+        pass
+
+    try:
+        ele.click()
+    except Exception:
+        try:
+            ele.click(by_js=True)
+        except Exception:
+            pass
+
+
 def find_turnstile_coords_via_cdp(page):
-    """通过 CDP DOM.getDocument(pierce=True) 穿透 Closed Shadow DOM 获取 Turnstile 复选框坐标"""
+    """通过 CDP DOM.getDocument(pierce=True) 穿透 Closed Shadow DOM 获取真实 Turnstile 复选框坐标"""
     try:
         doc = page.run_cdp("DOM.getDocument", depth=-1, pierce=True)
         root = doc.get("root", {})
@@ -149,7 +179,8 @@ def find_turnstile_coords_via_cdp(page):
 
         walk(root)
 
-        for bid in target_backend_ids:
+        # 逆序优先取最新弹出的 Turnstile (例如 Modal 弹窗中的组件)
+        for bid in reversed(target_backend_ids):
             try:
                 box = page.run_cdp("DOM.getBoxModel", backendNodeId=bid).get("model", {})
                 content = box.get("border") or box.get("content")
@@ -167,7 +198,10 @@ def find_turnstile_coords_via_cdp(page):
 
 
 def find_turnstile_coords_via_js(page):
-    """通过页面 DOM 特征定位 Turnstile 验证框坐标"""
+    """
+    严格通过 Turnstile 专属 DOM 特征定位验证框坐标
+    （已移除按宽高盲猜普通 div 的逻辑，防止误点控制面板按钮）
+    """
     try:
         coords = page.run_js("""
             const selectors = [
@@ -179,28 +213,23 @@ def find_turnstile_coords_via_js(page):
                 'div[id^="cf-chl-widget-"]'
             ];
             for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el) {
-                    const r = el.getBoundingClientRect();
+                const els = document.querySelectorAll(sel);
+                for (let i = els.length - 1; i >= 0; i--) {
+                    const r = els[i].getBoundingClientRect();
                     if (r.width >= 60 && r.height >= 25 && r.top > 0) {
                         return {x: r.left + 28, y: r.top + Math.min(r.height / 2, 32)};
                     }
                 }
             }
 
-            const inp = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile"]');
-            if (inp && inp.parentElement) {
-                const r = inp.parentElement.getBoundingClientRect();
-                if (r.width >= 60 && r.height >= 25 && r.top > 0) {
-                    return {x: r.left + 28, y: r.top + 32};
-                }
-            }
-
-            const divs = document.querySelectorAll('div');
-            for (const d of divs) {
-                const r = d.getBoundingClientRect();
-                if (r.width >= 240 && r.width <= 420 && r.height >= 55 && r.height <= 85 && r.top > 100) {
-                    return {x: r.left + 28, y: r.top + r.height / 2};
+            const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name*="turnstile"]');
+            for (let i = inputs.length - 1; i >= 0; i--) {
+                const p = inputs[i].parentElement;
+                if (p) {
+                    const r = p.getBoundingClientRect();
+                    if (r.width >= 60 && r.height >= 25 && r.top > 0) {
+                        return {x: r.left + 28, y: r.top + 32};
+                    }
                 }
             }
             return null;
@@ -213,10 +242,7 @@ def find_turnstile_coords_via_js(page):
 
 
 def find_email_input(page, timeout=1.5):
-    """
-    定位登录页第一步的账号输入框，
-    兼容无 type 属性的 React input 以及多语言 placeholder
-    """
+    """定位登录页第一步的账号输入框"""
     selectors = [
         'xpath://input[contains(@placeholder, "郵件") or contains(@placeholder, "名稱") or contains(@placeholder, "邮件") or contains(@placeholder, "名称") or contains(@placeholder, "email") or contains(@placeholder, "Email") or contains(@placeholder, "username") or contains(@placeholder, "Username")]',
         'css:input[type="email"], input[type="text"], input[name="email"], input[name="username"]',
@@ -230,7 +256,7 @@ def find_email_input(page, timeout=1.5):
 
 
 def is_chrome_error_page(page):
-    """检测浏览器是否因为代理断开而处于 Chrome 网络错误页"""
+    """检测浏览器是否处于网络错误页"""
     try:
         url = (page.url or "").lower()
         html = (page.html or "").upper()
@@ -250,26 +276,20 @@ def is_chrome_error_page(page):
 
 
 def wait_for_login_page_ready(page, timeout=45):
-    """
-    等待登录页加载出账号输入框；
-    若期间遇到全屏 Cloudflare 拦截页则自动点击通过
-    """
+    """等待登录页加载出账号输入框；若遇到全屏 Cloudflare 拦截页则自动点击通过"""
     print("[*] 正在等待登录界面加载 (自动处理可能出现的 Cloudflare 验证)...")
     start_time = time.time()
     attempt = 0
 
     while time.time() - start_time < timeout:
-        # 1. 如果已经出现账号输入框，说明已进入图1登录界面
         if find_email_input(page, timeout=1):
             print("[+] 登录页账号输入框已就绪！")
             return True
 
-        # 2. 检查是否遇到 Chrome 代理错误页
         if is_chrome_error_page(page):
             print("[!] 检测到浏览器网络/代理连接错误页！")
             return False
 
-        # 3. 检查是否存在全屏 Cloudflare 验证框
         coords = find_turnstile_coords_via_cdp(page) or find_turnstile_coords_via_js(page)
         title = (page.title or "").lower()
         html = (page.html or "").lower()
@@ -304,9 +324,9 @@ def get_cf_token(page):
     try:
         val = page.run_js("""
             const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name*="turnstile"], input[name*="cf-"]');
-            for (const inp of inputs) {
-                if (inp.value && inp.value.length > 20) {
-                    return inp.value;
+            for (let i = inputs.length - 1; i >= 0; i--) {
+                if (inputs[i].value && inputs[i].value.length > 20) {
+                    return inputs[i].value;
                 }
             }
             return "";
@@ -314,6 +334,19 @@ def get_cf_token(page):
         return str(val or "")
     except Exception:
         return ""
+
+
+def reset_cf_tokens(page):
+    """清空页面上残留的旧 Turnstile token"""
+    try:
+        page.run_js("""
+            const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name*="turnstile"]');
+            for (const inp of inputs) {
+                inp.value = "";
+            }
+        """)
+    except Exception:
+        pass
 
 
 def is_button_ready(btn):
@@ -335,7 +368,7 @@ def is_button_ready(btn):
 
 
 def find_step_button(page, keywords):
-    """查找『繼續』或『登入』主操作按钮"""
+    """查找登录步骤按钮"""
     for kw in keywords:
         btn = page.ele(
             f'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{kw.lower()}")]',
@@ -346,32 +379,28 @@ def find_step_button(page, keywords):
     return page.ele('css:button[type="submit"]', timeout=0.5)
 
 
-def pass_form_turnstile(page, stage_name, step_btn_keywords, timeout=35):
-    """
-    处理登录表单底部的 Cloudflare Turnstile 验证（对应图1 -> 图2），
-    当检测到 Token 生成或『繼續/登入』按钮已变为可点击状态时立即放行
-    """
+def pass_form_turnstile(page, stage_name, step_btn_keywords=None, timeout=35):
+    """处理表单内的 Cloudflare Turnstile 验证"""
     print(f"[*] 正在检查 [{stage_name}] 阶段的 Cloudflare 验证状态...")
     start_time = time.time()
     attempt = 0
 
     while time.time() - start_time < timeout:
         token = get_cf_token(page)
-        btn = find_step_button(page, step_btn_keywords)
+        btn = find_step_button(page, step_btn_keywords) if step_btn_keywords else None
 
-        # 如果已经有 token 且按钮已激活可点（如图2、图3的绿色“成功！”状态），直接通过
-        if len(token) > 20 and is_button_ready(btn):
-            print(f"[+] [{stage_name}] CF 验证已通过且按钮已激活！")
+        if len(token) > 20:
+            print(f"[+] [{stage_name}] 检测到 Turnstile Token (长度 {len(token)})，CF 验证通过！")
             return True
-        if is_button_ready(btn) and attempt >= 1:
-            print(f"[+] [{stage_name}] 检测到提交按钮已激活！")
+        if btn and is_button_ready(btn) and attempt >= 1:
+            print(f"[+] [{stage_name}] 检测到提交按钮已激活，CF 验证通过！")
             return True
 
         attempt += 1
         coords = find_turnstile_coords_via_cdp(page) or find_turnstile_coords_via_js(page)
         if coords:
             cx, cy = coords
-            print(f"[*] [{stage_name} 第{attempt}次] 点击下方 Cloudflare 验证框坐标: ({cx}, {cy})")
+            print(f"[*] [{stage_name} 第{attempt}次] 点击 Cloudflare 验证框坐标: ({cx}, {cy})")
             xdotool_click(page, cx, cy)
         elif attempt % 2 == 0:
             try:
@@ -382,17 +411,17 @@ def pass_form_turnstile(page, stage_name, step_btn_keywords, timeout=35):
         for _ in range(4):
             time.sleep(1)
             token = get_cf_token(page)
-            btn = find_step_button(page, step_btn_keywords)
-            if len(token) > 20 or is_button_ready(btn):
+            btn = find_step_button(page, step_btn_keywords) if step_btn_keywords else None
+            if len(token) > 20 or (btn and is_button_ready(btn)):
                 print(f"[+] [{stage_name}] CF 验证通过！")
                 return True
 
-    print(f"[!] [{stage_name}] CF 验证等待超时，尝试继续点击提交按钮...")
+    print(f"[!] [{stage_name}] CF 验证等待超时，尝试继续...")
     return False
 
 
 def fill_input_react(page, ele, text):
-    """适配 React Hook Form 受控输入框的填写方式"""
+    """适配 React 受控输入框的填写方式"""
     ele.click()
     time.sleep(0.2)
     ele.input(text, clear=True)
@@ -417,18 +446,202 @@ def fill_input_react(page, ele, text):
 
 
 def find_renew_button(page):
-    """定位控制面板右上角的绿色 'Click to renew' 按钮（对应图5）"""
+    """定位控制面板右上角的绿色 'Click to renew' 按钮"""
     selectors = [
         'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "click to renew")]',
-        'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
         'xpath://a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "click to renew")]',
+        'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
         'xpath://button[contains(., "續期") or contains(., "续期")]',
     ]
     for sel in selectors:
-        btn = page.ele(sel, timeout=2)
+        btn = page.ele(sel, timeout=1.5)
         if btn:
             return btn
     return None
+
+
+def find_modal_confirm_button(page):
+    """
+    查找点击 Click to renew 后弹窗 (Modal / Dialog) 内的确认或续期按钮，
+    严格排除页面原本的按钮与取消/关闭按钮
+    """
+    modal_xpaths = [
+        'xpath://*[@role="dialog" or @aria-modal="true" or contains(@class, "modal") or contains(@class, "Dialog") or contains(@class, "swal2")]//button',
+        'xpath://div[contains(@class, "fixed") and contains(@class, "inset-0")]//button',
+    ]
+    exclude_words = ["cancel", "close", "取消", "關閉", "关闭", "back", "返回"]
+    target_words = ["renew", "confirm", "continue", "submit", "yes", "ok", "確認", "确认", "續期", "续期", "繼續", "继续"]
+
+    for xp in modal_xpaths:
+        try:
+            btns = page.eles(xp, timeout=0.5)
+            for b in btns:
+                txt = (b.text or "").strip().lower()
+                if not txt:
+                    continue
+                if any(ex in txt for ex in exclude_words):
+                    continue
+                if any(tw in txt for tw in target_words):
+                    return b
+        except Exception:
+            continue
+    return None
+
+
+def get_page_notifications(page):
+    """收集页面上的弹窗提示、Toast 消息或错误横幅文本，便于排查"""
+    try:
+        return page.run_js("""
+            const selectors = [
+                '[role="alert"]',
+                '[role="status"]',
+                '[role="dialog"]',
+                '[aria-modal="true"]',
+                '.Toastify__toast',
+                '[data-sonner-toast]',
+                '.swal2-popup'
+            ];
+            const msgs = [];
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach(el => {
+                    const t = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+                    if (t && !msgs.includes(t)) msgs.push(t.slice(0, 200));
+                });
+            }
+            return msgs;
+        """) or []
+    except Exception:
+        return []
+
+
+def is_server_suspended_on_page(page):
+    """检查当前服务器控制面板是否仍然处于 SUSPENDED / 已停權 状态"""
+    try:
+        text = page.run_js("return document.body ? document.body.innerText : '';") or ""
+        suspended_markers = [
+            "你的伺服器目前已停權",
+            "你的服务器目前已停权",
+            "Renew to unsuspend your server",
+            "Renew once suspended",
+        ]
+        if any(m in text for m in suspended_markers):
+            return True
+        if "SUSPENDED" in text and "Expired" in text:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def execute_renew_flow(page, renew_btn):
+    """
+    执行完整的点击 Click to renew -> 处理弹窗/验证 -> 监听网络响应 -> 校验结果流程
+    """
+    reset_cf_tokens(page)
+
+    # 启动网络监听，捕获点击续期触发的后台 API 请求和响应
+    try:
+        page.listen.start("acorehosting.com")
+    except Exception:
+        pass
+
+    print(f"[*] 正在点击续期按钮: '{renew_btn.text}' (使用真实鼠标坐标 + DOM 点击)...")
+    click_element_robust(page, renew_btn)
+    time.sleep(3)
+
+    api_logs = []
+    start_time = time.time()
+    clicked_modal_btn = False
+    reclicked_after_cf = False
+
+    # 在 35 秒内循环处理可能出现的弹窗、Turnstile 验证、新标签页或二次确认按钮
+    while time.time() - start_time < 35:
+        # 1. 收集后台 API 响应包
+        try:
+            while True:
+                pkt = page.listen.wait(timeout=0.3)
+                if not pkt:
+                    break
+                url_str = pkt.url or ""
+                if any(k in url_str.lower() for k in ["renew", "server", "unsuspend", "billing", "verify", "captcha", "turnstile"]):
+                    status = pkt.response.status if pkt.response else "N/A"
+                    body_preview = str(pkt.response.body)[:300] if pkt.response else ""
+                    log_line = f"{pkt.method} {url_str} -> HTTP {status} | {body_preview}"
+                    if log_line not in api_logs:
+                        print(f"[API] {log_line}")
+                        api_logs.append(log_line)
+        except Exception:
+            pass
+
+        # 2. 检查是否弹出了新标签页 (例如验证跳转页)
+        if len(page.tab_ids) > 1:
+            latest = page.latest_tab
+            print(f"[*] 检测到新标签页打开: {latest.url}")
+            coords = find_turnstile_coords_via_cdp(latest) or find_turnstile_coords_via_js(latest)
+            if coords:
+                print(f"[*] 点击新标签页中的 Cloudflare 验证框: {coords}")
+                xdotool_click(latest, coords[0], coords[1])
+                time.sleep(4)
+
+        # 3. 检查当前页面或弹窗中是否出现了真正的 Cloudflare Turnstile 验证框
+        coords = find_turnstile_coords_via_cdp(page) or find_turnstile_coords_via_js(page)
+        if coords and len(get_cf_token(page)) <= 20:
+            print(f"[*] 检测到续期 Cloudflare Turnstile 验证框，真实坐标: {coords}，正在点击...")
+            xdotool_click(page, coords[0], coords[1])
+            time.sleep(4)
+            continue
+
+        # 4. 检查是否存在弹窗确认按钮 (Modal / Dialog)
+        modal_btn = find_modal_confirm_button(page)
+        if modal_btn and is_button_ready(modal_btn):
+            print(f"[*] 检测到续期弹窗确认按钮: '{modal_btn.text}'，正在点击...")
+            click_element_robust(page, modal_btn)
+            clicked_modal_btn = True
+            time.sleep(4)
+            continue
+
+        # 5. 如果通过了内联 Turnstile 生成了新 Token，且没有弹窗，则再次点击 Click to renew 提交
+        if len(get_cf_token(page)) > 20 and not clicked_modal_btn and not reclicked_after_cf:
+            cur_renew_btn = find_renew_button(page)
+            if cur_renew_btn and is_button_ready(cur_renew_btn):
+                print("[*] Turnstile Token 已生成，再次点击 'Click to renew' 提交续期请求...")
+                click_element_robust(page, cur_renew_btn)
+                reclicked_after_cf = True
+                time.sleep(4)
+                continue
+
+        # 6. 如果此时没有任何弹窗、没有 Turnstile、也没有触发任何 API 请求，说明第一次点击未生效，补点一次
+        if time.time() - start_time > 6 and not api_logs and not coords and not modal_btn and not reclicked_after_cf:
+            cur_renew_btn = find_renew_button(page)
+            if cur_renew_btn and is_button_ready(cur_renew_btn):
+                print("[*] 首次点击未触发网络请求或弹窗，正在使用 JS + 硬件鼠标二次点击 'Click to renew'...")
+                try:
+                    cur_renew_btn.click(by_js=True)
+                except Exception:
+                    pass
+                click_element_robust(page, cur_renew_btn)
+                reclicked_after_cf = True
+                time.sleep(4)
+                continue
+
+        # 7. 检查页面上是否已经解除停权或按钮已变为不可点状态
+        cur_renew_btn = find_renew_button(page)
+        if not is_server_suspended_on_page(page) or not cur_renew_btn or not is_button_ready(cur_renew_btn):
+            print("[+] 页面状态已更新：续期已完成或按钮已进入冷却状态！")
+            break
+
+        time.sleep(2)
+
+    try:
+        page.listen.stop()
+    except Exception:
+        pass
+
+    notifs = get_page_notifications(page)
+    if notifs:
+        print(f"[*] 页面提示信息: {notifs}")
+
+    return api_logs, notifs
 
 
 def main():
@@ -446,14 +659,14 @@ def main():
 
         page = create_browser(local_proxy)
 
-        # ==================== 打开登录页（若代理异常自动切换直连重试） ====================
+        # ==================== 打开登录页 ====================
         print(f"[*] 正在打开登录页: {LOGIN_URL}")
         page.get(LOGIN_URL)
         time.sleep(3)
 
         if not wait_for_login_page_ready(page, timeout=40):
             if local_proxy:
-                print("[!] 挂载代理状态下未能加载出登录框，正在关闭代理切换为直连模式重试...")
+                print("[!] 挂载代理状态下未能加载出登录框，正在切换为直连模式重试...")
                 try:
                     page.quit()
                 except Exception:
@@ -469,11 +682,10 @@ def main():
                 time.sleep(4)
                 wait_for_login_page_ready(page, timeout=35)
 
-        # ==================== 第一步：输入账号 -> 过 CF 验证 -> 点击『繼續』（图1 & 图2） ====================
+        # ==================== 第一步：输入账号 -> 过 CF 验证 -> 点击继续 ====================
         print("[*] 正在定位并填写账号...")
         email_input = find_email_input(page, timeout=10)
         if not email_input:
-            print(f"[!] 当前页面 URL: {page.url}, 标题: {page.title}")
             page.get_screenshot(path="error_no_email_input.png")
             raise RuntimeError("未找到账号输入框，请查看截图 error_no_email_input.png")
 
@@ -491,11 +703,10 @@ def main():
         else:
             email_input.input("\n")
 
-        # ==================== 第二步：输入密码 -> 点击『登入』（图3） ====================
+        # ==================== 第二步：输入密码 -> 点击登入 ====================
         print("[*] 等待密码输入框加载...")
         pwd_input = page.ele('css:input[type="password"]', timeout=15)
         if not pwd_input:
-            print("[*] 第一次点击未进入密码页，补充验证并再次点击『繼續』...")
             pass_form_turnstile(page, stage_name="第一步重试", step_btn_keywords=step1_btns, timeout=20)
             btn1 = find_step_button(page, step1_btns)
             if btn1:
@@ -513,7 +724,6 @@ def main():
         step2_btns = ["登入", "登录", "login", "sign in"]
         btn2 = find_step_button(page, step2_btns)
 
-        # 图3中第一步的 CF 验证通常保持“成功！”且登入按钮直接可用；若不可用再点击验证框
         if not is_button_ready(btn2):
             pass_form_turnstile(page, stage_name="第二步(密码页)", step_btn_keywords=step2_btns, timeout=30)
             btn2 = find_step_button(page, step2_btns)
@@ -526,7 +736,6 @@ def main():
         else:
             pwd_input.input("\n")
 
-        # 等待跳转离开登录页；若 6 秒后仍在登录页则补点一次 CF 验证并再次点击登入
         for _ in range(6):
             time.sleep(1)
             if "auth/login" not in page.url:
@@ -543,41 +752,36 @@ def main():
                 if "auth/login" not in page.url:
                     break
 
-        # ==================== 第三步：进入服务器控制面板（图4 -> 图5） ====================
+        # ==================== 第三步：进入服务器控制面板 ====================
         print(f"[*] 登录后页面 URL: {page.url}")
         if "auth/login" in page.url:
             page.get_screenshot(path="error_login.png")
             raise RuntimeError("登录后仍停留在登录页，请检查账号密码或查看截图 error_login.png")
 
         time.sleep(3)
-        page.get_screenshot(path="step3_server_list.png")
 
         if SERVER_ID:
             target_url = SERVER_ID if SERVER_ID.startswith("http") else f"{DASH_URL}/server/{SERVER_ID.strip('/')}"
             print(f"[*] 已配置 SERVER_ID，直接进入服务器面板: {target_url}")
             page.get(target_url)
         else:
-            print("[*] 正在服务器列表页点击进入服务器 (图4)...")
+            print("[*] 正在服务器列表页点击进入服务器...")
             srv_target = (
                 page.ele('xpath://a[contains(@href, "/server/")]', timeout=5)
                 or page.ele('xpath://*[contains(text(), "Lick") or contains(text(), "已停權") or contains(text(), "Suspended")]', timeout=5)
                 or page.ele('xpath://*[contains(text(), ":20") or contains(text(), "MiB") or contains(text(), "GiB")]', timeout=5)
             )
             if srv_target:
-                print(f"[*] 点击服务器卡片元素: {srv_target.text}")
                 srv_target.click()
                 time.sleep(4)
-
             if "/server/" not in page.url:
-                fallback_url = f"{DASH_URL}/server/{DEFAULT_SERVER_ID}"
-                print(f"[*] 点击卡片未发生跳转，直接导航至服务器地址: {fallback_url}")
-                page.get(fallback_url)
+                page.get(f"{DASH_URL}/server/{DEFAULT_SERVER_ID}")
 
         time.sleep(5)
         print(f"[*] 已进入服务器控制面板: {page.url}")
         page.get_screenshot(path="panel_status.png")
 
-        # ==================== 第四步：点击右上角绿色 Click to renew 按钮（图5） ====================
+        # ==================== 第四步：点击 Click to renew 并真实校验续期结果 ====================
         print("[*] 正在查找右上角 Click to renew 按钮...")
         renew_btn = find_renew_button(page)
 
@@ -587,51 +791,47 @@ def main():
 
         print(f"[*] 找到续期按钮: '{renew_btn.text}'")
 
-        status_hint = ""
-        hint_ele = page.ele(
-            'xpath://*[contains(text(), "Renew once suspended") or contains(text(), "Renew available") or contains(text(), "Until suspension") or contains(text(), "Deletes in")]',
-            timeout=2,
-        )
-        if hint_ele:
-            status_hint = hint_ele.text
-
-        if not is_button_ready(renew_btn):
-            msg = f"当前续期按钮 ({renew_btn.text}) 处于不可点击（未到期/冷却中）状态，无需操作。\n面板提示: {status_hint}"
+        if not is_button_ready(renew_btn) and not is_server_suspended_on_page(page):
+            msg = f"当前续期按钮 ({renew_btn.text}) 处于不可点击（未到期/冷却中）状态，且服务器状态正常，无需操作。"
             print(f"[=] {msg}")
             send_tg(msg)
-        else:
-            print(f"[+] 检测到 '{renew_btn.text}' 可点击！正在执行点击续期...")
-            renew_btn.click()
+            return
+
+        print(f"[+] 检测到 '{renew_btn.text}' 可点击！开始执行续期流程...")
+        api_logs, notifs = execute_renew_flow(page, renew_btn)
+        page.get_screenshot(path="after_renew_click.png")
+
+        # 刷新页面以验证服务器端真实状态是否已解除停权
+        print("[*] 正在刷新控制面板以核实服务器真实续期状态...")
+        page.refresh()
+        time.sleep(6)
+        page.get_screenshot(path="renew_result.png")
+
+        still_suspended = is_server_suspended_on_page(page)
+        renew_btn_after = find_renew_button(page)
+        still_can_renew = is_button_ready(renew_btn_after) if renew_btn_after else False
+
+        if still_suspended and still_can_renew:
+            detail = f"API记录: {api_logs} | 页面提示: {notifs}"
+            raise RuntimeError(
+                f"点击 Click to renew 后刷新页面，服务器仍处于已停权 (SUSPENDED) 状态！请下载 runtime-screenshots 查看 after_renew_click.png。详情: {detail}"
+            )
+
+        # ==================== 第五步：解除停权后自动点击『啟動 / Start』开机 ====================
+        print("[*] 正在检查服务器是否需要开机 (啟動 / Start)...")
+        start_btn = page.ele(
+            'xpath://button[normalize-space(.)="啟動" or normalize-space(.)="启动" or translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")="start"]',
+            timeout=5,
+        )
+        if start_btn and is_button_ready(start_btn):
+            print("[+] 检测到『啟動 / Start』按钮可用，正在点击启动服务器...")
+            click_element_robust(page, start_btn)
             time.sleep(5)
+            page.get_screenshot(path="server_started.png")
 
-            # 若点击后出现弹窗验证或确认按钮则一并处理
-            coords = find_turnstile_coords_via_cdp(page) or find_turnstile_coords_via_js(page)
-            if coords:
-                pass_form_turnstile(page, stage_name="续期弹窗", step_btn_keywords=["confirm", "確認", "确认", "renew"], timeout=25)
-
-            confirm_btn = page.ele(
-                'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "confirm") or contains(., "確認") or contains(., "确认")]',
-                timeout=3,
-            )
-            if confirm_btn and is_button_ready(confirm_btn):
-                print(f"[*] 点击确认按钮: {confirm_btn.text}")
-                confirm_btn.click()
-                time.sleep(4)
-
-            # 续期解封后如果『啟動 / Start』按钮亮起，顺便启动服务器
-            start_btn = page.ele(
-                'xpath://button[normalize-space(.)="啟動" or normalize-space(.)="启动" or translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")="start"]',
-                timeout=3,
-            )
-            if start_btn and is_button_ready(start_btn):
-                print("[*] 检测到『啟動』按钮可用，正在启动服务器...")
-                start_btn.click()
-                time.sleep(3)
-
-            page.get_screenshot(path="renew_result.png")
-            msg = f"✅ 已成功点击 '{renew_btn.text}' 完成续期！\n当前面板 URL: {page.url}"
-            print(f"[+] {msg}")
-            send_tg(msg)
+        msg = f"✅ 已成功完成续期并验证解除停权状态！\n当前面板 URL: {page.url}"
+        print(f"[+] {msg}")
+        send_tg(msg)
 
     except Exception as e:
         err_msg = f"❌ 运行异常: {str(e)}"
