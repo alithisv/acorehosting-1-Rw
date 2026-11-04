@@ -27,7 +27,7 @@ jobs:
       - name: 4. 安装系统依赖与 sing-box 代理核心
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb xdotool wget curl unzip libxi6 libnss3
+          sudo apt-get install -y xvfb openbox xdotool wget curl unzip libxi6 libnss3 fonts-noto-cjk
           
           # 安装 sing-box 以支持 vless / vmess / hy2 / trojan 协议
           SB_VER="1.10.7"
@@ -49,7 +49,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" bash -c "openbox & sleep 1 && python renew.py"
 
       - name: 6. 上传运行截图 (用于排错检查)
         if: always()
