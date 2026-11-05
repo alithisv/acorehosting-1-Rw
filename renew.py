@@ -115,7 +115,12 @@ def xdotool_click(page, client_x, client_y):
 
 
 def click_element_robust(page, ele):
-    """同时使用 DOM 点击与真实鼠标坐标点击目标元素，确保 React 事件必被触发"""
+    """
+    四重保险点击目标按钮（绝不中途提前 return）：
+    1. DrissionPage 原生模拟点击
+    2. JS 原生 MouseEvent 完整事件链 + React Fiber onClick 直接触发
+    3. DrissionPage 元素的 actions.move_to(ele).click()
+    """
     if not ele:
         return
     try:
@@ -124,24 +129,52 @@ def click_element_robust(page, ele):
     except Exception:
         pass
 
+    # 方式 1：DrissionPage 标准原生点击
     try:
-        rect = ele.rect
-        if rect and rect.size[0] > 5 and rect.size[1] > 5:
-            cx = int(rect.location[0] + rect.size[0] / 2)
-            cy = int(rect.location[1] + rect.size[1] / 2)
-            xdotool_click(page, cx, cy)
-            time.sleep(0.3)
-            return
+        ele.click()
+        time.sleep(0.3)
     except Exception:
         pass
 
+    # 方式 2：DrissionPage 动作链移动到元素中心点击
     try:
-        ele.click()
+        page.actions.move_to(ele).click()
+        time.sleep(0.3)
     except Exception:
-        try:
-            ele.click(by_js=True)
-        except Exception:
-            pass
+        pass
+
+    # 方式 3：通过 JS 派发完整 Pointer/Mouse 事件链，并直接检索调用 React 底层的 onClick 属性
+    try:
+        page.run_js(
+            """
+            const el = arguments[0];
+            if (!el) return;
+            const opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
+            el.dispatchEvent(new PointerEvent('pointerdown', opts));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.click();
+
+            // 直接查找 React 17/18 挂载在 DOM 节点上的 __reactProps$ 并触发 onClick
+            const propKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            if (propKey && el[propKey] && typeof el[propKey].onClick === 'function') {
+                try {
+                    el[propKey].onClick({
+                        preventDefault: () => {},
+                        stopPropagation: () => {},
+                        target: el,
+                        currentTarget: el,
+                        nativeEvent: new MouseEvent('click', opts)
+                    });
+                } catch (e) {}
+            }
+            """,
+            ele,
+        )
+        time.sleep(0.3)
+    except Exception:
+        pass
 
 
 def find_turnstile_coords_via_cdp(page):
@@ -179,7 +212,6 @@ def find_turnstile_coords_via_cdp(page):
 
         walk(root)
 
-        # 逆序优先取最新弹出的 Turnstile (例如 Modal 弹窗中的组件)
         for bid in reversed(target_backend_ids):
             try:
                 box = page.run_cdp("DOM.getBoxModel", backendNodeId=bid).get("model", {})
@@ -198,10 +230,7 @@ def find_turnstile_coords_via_cdp(page):
 
 
 def find_turnstile_coords_via_js(page):
-    """
-    严格通过 Turnstile 专属 DOM 特征定位验证框坐标
-    （已移除按宽高盲猜普通 div 的逻辑，防止误点控制面板按钮）
-    """
+    """严格通过 Turnstile 专属 DOM 特征定位验证框坐标"""
     try:
         coords = page.run_js("""
             const selectors = [
@@ -460,11 +489,32 @@ def find_renew_button(page):
     return None
 
 
+def inspect_renew_button(page, btn):
+    """输出 Click to renew 按钮的 HTML 结构与绑定的 React 属性，辅助排错"""
+    try:
+        info = page.run_js(
+            """
+            const el = arguments[0];
+            if (!el) return {};
+            const propKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            const reactProps = propKey ? Object.keys(el[propKey] || {}) : [];
+            return {
+                tag: el.tagName,
+                outerHTML: (el.outerHTML || '').slice(0, 300),
+                parentHTML: (el.parentElement ? el.parentElement.outerHTML : '').slice(0, 350),
+                reactProps: reactProps,
+                rect: el.getBoundingClientRect()
+            };
+            """,
+            btn,
+        )
+        print(f"[*] 续期按钮 DOM 详情: {info}")
+    except Exception as e:
+        print(f"[!] 获取按钮详情异常: {e}")
+
+
 def find_modal_confirm_button(page):
-    """
-    查找点击 Click to renew 后弹窗 (Modal / Dialog) 内的确认或续期按钮，
-    严格排除页面原本的按钮与取消/关闭按钮
-    """
+    """查找点击 Click to renew 后弹窗 (Modal / Dialog) 内的确认或续期按钮"""
     modal_xpaths = [
         'xpath://*[@role="dialog" or @aria-modal="true" or contains(@class, "modal") or contains(@class, "Dialog") or contains(@class, "swal2")]//button',
         'xpath://div[contains(@class, "fixed") and contains(@class, "inset-0")]//button',
@@ -489,7 +539,7 @@ def find_modal_confirm_button(page):
 
 
 def get_page_notifications(page):
-    """收集页面上的弹窗提示、Toast 消息或错误横幅文本，便于排查"""
+    """收集页面上的弹窗提示、Toast 消息或错误横幅文本"""
     try:
         return page.run_js("""
             const selectors = [
@@ -533,47 +583,150 @@ def is_server_suspended_on_page(page):
     return False
 
 
-def execute_renew_flow(page, renew_btn):
+def try_direct_serverplans_api_renew(page, server_uuid=None, cf_token=""):
     """
-    执行完整的点击 Click to renew -> 处理弹窗/验证 -> 监听网络响应 -> 校验结果流程
+    针对 AcoreHosting 使用的 dev.sqidgeon.serverplans 扩展，
+    直接在浏览器上下文中携带 Cookie + X-XSRF-TOKEN 调用后台续期 API
     """
-    reset_cf_tokens(page)
+    print("[*] 正在尝试通过 dev.sqidgeon.serverplans 扩展接口直接发起续期请求...")
+    try:
+        res = page.run_js(
+            """
+            const passedUuid = arguments[0];
+            const cfToken = arguments[1];
 
-    # 启动网络监听，捕获点击续期触发的后台 API 请求和响应
+            return (async () => {
+                const results = [];
+                // 获取 XSRF-TOKEN
+                let xsrf = '';
+                const match = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+                if (match) xsrf = decodeURIComponent(match[1]);
+
+                const headers = {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                };
+                if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
+
+                // 1. 先从 mine 接口或页面 URL 获取服务器完整 UUID
+                let uuid = passedUuid;
+                const shortId = window.location.pathname.split('/server/')[1]?.split('/')[0] || '';
+                if (!uuid) {
+                    try {
+                        const r = await fetch(`/api/client/extensions/dev.sqidgeon.serverplans/mine`, { headers });
+                        const d = await r.json();
+                        if (d && Array.isArray(d.servers) && d.servers.length > 0) {
+                            uuid = d.servers[0].uuid;
+                        }
+                    } catch (e) {}
+                }
+
+                const serverIdCandidates = [uuid, shortId].filter(Boolean);
+                const bodyPayloads = [
+                    JSON.stringify({ server: uuid || shortId, ...(cfToken ? {'cf-turnstile-response': cfToken, token: cfToken} : {}) }),
+                    JSON.stringify({ ...(cfToken ? {'cf-turnstile-response': cfToken, token: cfToken} : {}) })
+                ];
+
+                // 2. 尝试 dev.sqidgeon.serverplans 常见的续期端点
+                const endpoints = [];
+                for (const sid of serverIdCandidates) {
+                    endpoints.push(`/api/client/servers/${sid}/extensions/dev.sqidgeon.serverplans/renew`);
+                    endpoints.push(`/api/client/extensions/dev.sqidgeon.serverplans/renew?server=${sid}`);
+                    endpoints.push(`/api/client/extensions/dev.sqidgeon.serverplans/idle/renew?server=${sid}`);
+                    endpoints.push(`/api/client/servers/${sid}/extensions/dev.sqidgeon.serverplans/idle/renew`);
+                    endpoints.push(`/api/client/servers/${sid}/renew`);
+                }
+                endpoints.push(`/api/client/extensions/dev.sqidgeon.serverplans/renew`);
+
+                for (const ep of endpoints) {
+                    for (const method of ['POST', 'PUT']) {
+                        try {
+                            const resp = await fetch(ep, {
+                                method: method,
+                                headers: headers,
+                                body: bodyPayloads[0],
+                                credentials: 'same-origin'
+                            });
+                            const text = await resp.text();
+                            results.push(`${method} ${ep} -> ${resp.status}: ${text.slice(0, 180)}`);
+                            if (resp.status >= 200 && resp.status < 300) {
+                                return { ok: true, endpoint: ep, status: resp.status, body: text.slice(0, 300), logs: results };
+                            }
+                        } catch (err) {
+                            results.push(`${method} ${ep} -> ERR: ${err.message}`);
+                        }
+                        // 如果返回 404 或 405 则无需尝试 PUT
+                        if (results[results.length - 1].includes('-> 404') || results[results.length - 1].includes('-> 405')) {
+                            break;
+                        }
+                    }
+                }
+                return { ok: false, logs: results };
+            })();
+            """,
+            server_uuid,
+            cf_token,
+        )
+        print(f"[*] 扩展 API 探测结果: {res}")
+        return res
+    except Exception as e:
+        print(f"[!] 调用扩展 API 异常: {e}")
+        return None
+
+
+def execute_renew_flow(page, renew_btn):
+    """执行完整的点击 Click to renew -> 处理弹窗/验证 -> 监听网络响应 -> 校验结果流程"""
+    reset_cf_tokens(page)
+    inspect_renew_button(page, renew_btn)
+
     try:
         page.listen.start("acorehosting.com")
     except Exception:
         pass
 
-    print(f"[*] 正在点击续期按钮: '{renew_btn.text}' (使用真实鼠标坐标 + DOM 点击)...")
+    print(f"[*] 正在点击续期按钮: '{renew_btn.text}' (使用 DOM + React Fiber + 鼠标动作链)...")
     click_element_robust(page, renew_btn)
     time.sleep(3)
 
     api_logs = []
+    mutation_api_logs = []  # 专门记录非 GET 请求 (POST / PUT / PATCH)
+    detected_uuid = None
     start_time = time.time()
     clicked_modal_btn = False
-    reclicked_after_cf = False
+    reclicked_count = 0
 
-    # 在 35 秒内循环处理可能出现的弹窗、Turnstile 验证、新标签页或二次确认按钮
     while time.time() - start_time < 35:
         # 1. 收集后台 API 响应包
         try:
             while True:
-                pkt = page.listen.wait(timeout=0.3)
+                pkt = page.listen.wait(timeout=0.4)
                 if not pkt:
                     break
                 url_str = pkt.url or ""
-                if any(k in url_str.lower() for k in ["renew", "server", "unsuspend", "billing", "verify", "captcha", "turnstile"]):
+                method_str = (pkt.method or "GET").upper()
+
+                # 从 serverplans/mine 请求 URL 或响应体提取服务器完整 UUID
+                if "server=" in url_str and not detected_uuid:
+                    detected_uuid = url_str.split("server=")[-1].split("&")[0]
+                if not detected_uuid and pkt.response and isinstance(pkt.response.body, dict):
+                    srvs = pkt.response.body.get("servers")
+                    if isinstance(srvs, list) and srvs and isinstance(srvs[0], dict):
+                        detected_uuid = srvs[0].get("uuid")
+
+                if any(k in url_str.lower() for k in ["renew", "server", "unsuspend", "billing", "verify", "captcha", "turnstile", "idle"]):
                     status = pkt.response.status if pkt.response else "N/A"
                     body_preview = str(pkt.response.body)[:300] if pkt.response else ""
-                    log_line = f"{pkt.method} {url_str} -> HTTP {status} | {body_preview}"
+                    log_line = f"{method_str} {url_str} -> HTTP {status} | {body_preview}"
                     if log_line not in api_logs:
                         print(f"[API] {log_line}")
                         api_logs.append(log_line)
+                    if method_str in ("POST", "PUT", "PATCH"):
+                        mutation_api_logs.append(log_line)
         except Exception:
             pass
 
-        # 2. 检查是否弹出了新标签页 (例如验证跳转页)
+        # 2. 检查是否弹出了新标签页
         if len(page.tab_ids) > 1:
             latest = page.latest_tab
             print(f"[*] 检测到新标签页打开: {latest.url}")
@@ -600,27 +753,23 @@ def execute_renew_flow(page, renew_btn):
             time.sleep(4)
             continue
 
-        # 5. 如果通过了内联 Turnstile 生成了新 Token，且没有弹窗，则再次点击 Click to renew 提交
-        if len(get_cf_token(page)) > 20 and not clicked_modal_btn and not reclicked_after_cf:
+        # 5. 如果通过了内联 Turnstile 生成了新 Token，再次点击 Click to renew 提交
+        if len(get_cf_token(page)) > 20 and not clicked_modal_btn and reclicked_count < 2:
             cur_renew_btn = find_renew_button(page)
             if cur_renew_btn and is_button_ready(cur_renew_btn):
                 print("[*] Turnstile Token 已生成，再次点击 'Click to renew' 提交续期请求...")
                 click_element_robust(page, cur_renew_btn)
-                reclicked_after_cf = True
+                reclicked_count += 1
                 time.sleep(4)
                 continue
 
-        # 6. 如果此时没有任何弹窗、没有 Turnstile、也没有触发任何 API 请求，说明第一次点击未生效，补点一次
-        if time.time() - start_time > 6 and not api_logs and not coords and not modal_btn and not reclicked_after_cf:
+        # 6. 关键改进：只看是否产生了 POST/PUT 请求 (mutation_api_logs)，忽略面板后台的 GET 轮询
+        if time.time() - start_time > 6 and not mutation_api_logs and not coords and not modal_btn and reclicked_count < 2:
             cur_renew_btn = find_renew_button(page)
             if cur_renew_btn and is_button_ready(cur_renew_btn):
-                print("[*] 首次点击未触发网络请求或弹窗，正在使用 JS + 硬件鼠标二次点击 'Click to renew'...")
-                try:
-                    cur_renew_btn.click(by_js=True)
-                except Exception:
-                    pass
+                reclicked_count += 1
+                print(f"[*] 未检测到任何 POST 续期请求，正在执行第 {reclicked_count} 次强力补点 'Click to renew'...")
                 click_element_robust(page, cur_renew_btn)
-                reclicked_after_cf = True
                 time.sleep(4)
                 continue
 
@@ -636,6 +785,13 @@ def execute_renew_flow(page, renew_btn):
         page.listen.stop()
     except Exception:
         pass
+
+    # 如果点击完还是没有触发任何 POST 请求，或者页面仍显示已停权，则启动 API 直连兜底
+    if is_server_suspended_on_page(page):
+        cf_tok = get_cf_token(page)
+        api_res = try_direct_serverplans_api_renew(page, server_uuid=detected_uuid, cf_token=cf_tok)
+        if api_res:
+            api_logs.append(f"DIRECT_API: {api_res}")
 
     notifs = get_page_notifications(page)
     if notifs:
@@ -814,7 +970,7 @@ def main():
         if still_suspended and still_can_renew:
             detail = f"API记录: {api_logs} | 页面提示: {notifs}"
             raise RuntimeError(
-                f"点击 Click to renew 后刷新页面，服务器仍处于已停权 (SUSPENDED) 状态！请下载 runtime-screenshots 查看 after_renew_click.png。详情: {detail}"
+                f"点击 Click to renew 后刷新页面，服务器仍处于已停权 (SUSPENDED) 状态！详情: {detail}"
             )
 
         # ==================== 第五步：解除停权后自动点击『啟動 / Start』开机 ====================
