@@ -114,9 +114,12 @@ def xdotool_click(page, client_x, client_y):
         pass
 
 
-def click_single_clean(page, ele):
+def click_element_robust(page, ele):
     """
-    干净地单次点击 Mantine / React 按钮（避免连点 3 次导致打开弹窗后又把弹窗关掉）
+    四重保险点击目标按钮（绝不中途提前 return）：
+    1. DrissionPage 原生模拟点击
+    2. JS 原生 MouseEvent 完整事件链 + React Fiber onClick 直接触发
+    3. DrissionPage 元素的 actions.move_to(ele).click()
     """
     if not ele:
         return
@@ -126,14 +129,50 @@ def click_single_clean(page, ele):
     except Exception:
         pass
 
+    # 方式 1：DrissionPage 标准原生点击
     try:
         ele.click()
-        return
+        time.sleep(0.3)
     except Exception:
         pass
 
+    # 方式 2：DrissionPage 动作链移动到元素中心点击
     try:
-        ele.click(by_js=True)
+        page.actions.move_to(ele).click()
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    # 方式 3：通过 JS 派发完整 Pointer/Mouse 事件链，并直接检索调用 React 底层的 onClick 属性
+    try:
+        page.run_js(
+            """
+            const el = arguments[0];
+            if (!el) return;
+            const opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
+            el.dispatchEvent(new PointerEvent('pointerdown', opts));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.click();
+
+            // 直接查找 React 17/18 挂载在 DOM 节点上的 __reactProps$ 并触发 onClick
+            const propKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            if (propKey && el[propKey] && typeof el[propKey].onClick === 'function') {
+                try {
+                    el[propKey].onClick({
+                        preventDefault: () => {},
+                        stopPropagation: () => {},
+                        target: el,
+                        currentTarget: el,
+                        nativeEvent: new MouseEvent('click', opts)
+                    });
+                } catch (e) {}
+            }
+            """,
+            ele,
+        )
+        time.sleep(0.3)
     except Exception:
         pass
 
@@ -440,8 +479,8 @@ def find_renew_button(page):
     selectors = [
         'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "click to renew")]',
         'xpath://a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "click to renew")]',
-        'xpath://div[contains(@class, "acore-renewal-action")]//button',
         'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
+        'xpath://button[contains(., "續期") or contains(., "续期")]',
     ]
     for sel in selectors:
         btn = page.ele(sel, timeout=1.5)
@@ -450,41 +489,38 @@ def find_renew_button(page):
     return None
 
 
-def find_modal_confirm_button(page):
-    """
-    精准查找点击 Click to renew 后弹出的 Mantine Dialog 内的 'Unsuspend' / 'Renew' 确认按钮
-    （对应日志捕获的弹窗：'Unsuspend server - Unsuspend Lick to renew it. [Cancel] [Unsuspend]'）
-    """
-    # 1. 直接优先查找文字为 Unsuspend / 解除停權 的 button
-    direct_selectors = [
-        'xpath://*[@role="dialog" or contains(@class, "mantine-Modal") or contains(@class, "mantine-Dialog")]//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "unsuspend")]',
-        'xpath://button[translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")="unsuspend"]',
-        'xpath://button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "unsuspend") and not(contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "click to renew"))]',
-    ]
-    for sel in direct_selectors:
-        btn = page.ele(sel, timeout=0.5)
-        if btn:
-            return btn
+def inspect_renew_button(page, btn):
+    """输出 Click to renew 按钮的 HTML 结构与绑定的 React 属性，辅助排错"""
+    try:
+        info = page.run_js(
+            """
+            const el = arguments[0];
+            if (!el) return {};
+            const propKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+            const reactProps = propKey ? Object.keys(el[propKey] || {}) : [];
+            return {
+                tag: el.tagName,
+                outerHTML: (el.outerHTML || '').slice(0, 300),
+                parentHTML: (el.parentElement ? el.parentElement.outerHTML : '').slice(0, 350),
+                reactProps: reactProps,
+                rect: el.getBoundingClientRect()
+            };
+            """,
+            btn,
+        )
+        print(f"[*] 续期按钮 DOM 详情: {info}")
+    except Exception as e:
+        print(f"[!] 获取按钮详情异常: {e}")
 
-    # 2. 扫描所有 dialog / modal 容器内的确认按钮
+
+def find_modal_confirm_button(page):
+    """查找点击 Click to renew 后弹窗 (Modal / Dialog) 内的确认或续期按钮"""
     modal_xpaths = [
-        'xpath://*[@role="dialog" or @aria-modal="true" or contains(@class, "Modal") or contains(@class, "Dialog")]//button',
+        'xpath://*[@role="dialog" or @aria-modal="true" or contains(@class, "modal") or contains(@class, "Dialog") or contains(@class, "swal2")]//button',
+        'xpath://div[contains(@class, "fixed") and contains(@class, "inset-0")]//button',
     ]
-    exclude_words = ["cancel", "close", "取消", "關閉", "关闭", "back", "返回", "click to renew"]
-    target_words = [
-        "unsuspend",
-        "renew",
-        "confirm",
-        "continue",
-        "submit",
-        "yes",
-        "解除停權",
-        "解除停权",
-        "確認",
-        "确认",
-        "續期",
-        "续期",
-    ]
+    exclude_words = ["cancel", "close", "取消", "關閉", "关闭", "back", "返回"]
+    target_words = ["renew", "confirm", "continue", "submit", "yes", "ok", "確認", "确认", "續期", "续期", "繼續", "继续"]
 
     for xp in modal_xpaths:
         try:
@@ -511,16 +547,15 @@ def get_page_notifications(page):
                 '[role="status"]',
                 '[role="dialog"]',
                 '[aria-modal="true"]',
-                '.mantine-Notification-root',
-                '.mantine-Alert-root',
                 '.Toastify__toast',
-                '[data-sonner-toast]'
+                '[data-sonner-toast]',
+                '.swal2-popup'
             ];
             const msgs = [];
             for (const sel of selectors) {
                 document.querySelectorAll(sel).forEach(el => {
                     const t = (el.innerText || '').trim().replace(/\\s+/g, ' ');
-                    if (t && !msgs.includes(t)) msgs.push(t.slice(0, 220));
+                    if (t && !msgs.includes(t)) msgs.push(t.slice(0, 200));
                 });
             }
             return msgs;
@@ -550,10 +585,10 @@ def is_server_suspended_on_page(page):
 
 def try_direct_serverplans_api_renew(page, server_uuid=None, cf_token=""):
     """
-    直接调用 AcoreHosting 真实的续期接口:
-    POST /api/client/extensions/dev.sqidgeon.serverplans/renew?server=<uuid>
+    针对 AcoreHosting 使用的 dev.sqidgeon.serverplans 扩展，
+    直接在浏览器上下文中携带 Cookie + X-XSRF-TOKEN 调用后台续期 API
     """
-    print("[*] 正在通过 dev.sqidgeon.serverplans/renew 接口发起续期请求...")
+    print("[*] 正在尝试通过 dev.sqidgeon.serverplans 扩展接口直接发起续期请求...")
     try:
         res = page.run_js(
             """
@@ -561,6 +596,8 @@ def try_direct_serverplans_api_renew(page, server_uuid=None, cf_token=""):
             const cfToken = arguments[1];
 
             return (async () => {
+                const results = [];
+                // 获取 XSRF-TOKEN
                 let xsrf = '';
                 const match = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
                 if (match) xsrf = decodeURIComponent(match[1]);
@@ -572,7 +609,9 @@ def try_direct_serverplans_api_renew(page, server_uuid=None, cf_token=""):
                 };
                 if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
 
+                // 1. 先从 mine 接口或页面 URL 获取服务器完整 UUID
                 let uuid = passedUuid;
+                const shortId = window.location.pathname.split('/server/')[1]?.split('/')[0] || '';
                 if (!uuid) {
                     try {
                         const r = await fetch(`/api/client/extensions/dev.sqidgeon.serverplans/mine`, { headers });
@@ -583,68 +622,82 @@ def try_direct_serverplans_api_renew(page, server_uuid=None, cf_token=""):
                     } catch (e) {}
                 }
 
-                if (!uuid) return { ok: false, error: '未能获取到服务器 UUID' };
+                const serverIdCandidates = [uuid, shortId].filter(Boolean);
+                const bodyPayloads = [
+                    JSON.stringify({ server: uuid || shortId, ...(cfToken ? {'cf-turnstile-response': cfToken, token: cfToken} : {}) }),
+                    JSON.stringify({ ...(cfToken ? {'cf-turnstile-response': cfToken, token: cfToken} : {}) })
+                ];
 
-                const ep = `/api/client/extensions/dev.sqidgeon.serverplans/renew?server=${uuid}`;
-                const payload = cfToken ? JSON.stringify({ 'cf-turnstile-response': cfToken, token: cfToken }) : JSON.stringify({});
-
-                try {
-                    const resp = await fetch(ep, {
-                        method: 'POST',
-                        headers: headers,
-                        body: payload,
-                        credentials: 'same-origin'
-                    });
-                    const text = await resp.text();
-                    return {
-                        ok: resp.status >= 200 && resp.status < 300,
-                        status: resp.status,
-                        endpoint: ep,
-                        body: text.slice(0, 400)
-                    };
-                } catch (err) {
-                    return { ok: false, error: err.message };
+                // 2. 尝试 dev.sqidgeon.serverplans 常见的续期端点
+                const endpoints = [];
+                for (const sid of serverIdCandidates) {
+                    endpoints.push(`/api/client/servers/${sid}/extensions/dev.sqidgeon.serverplans/renew`);
+                    endpoints.push(`/api/client/extensions/dev.sqidgeon.serverplans/renew?server=${sid}`);
+                    endpoints.push(`/api/client/extensions/dev.sqidgeon.serverplans/idle/renew?server=${sid}`);
+                    endpoints.push(`/api/client/servers/${sid}/extensions/dev.sqidgeon.serverplans/idle/renew`);
+                    endpoints.push(`/api/client/servers/${sid}/renew`);
                 }
+                endpoints.push(`/api/client/extensions/dev.sqidgeon.serverplans/renew`);
+
+                for (const ep of endpoints) {
+                    for (const method of ['POST', 'PUT']) {
+                        try {
+                            const resp = await fetch(ep, {
+                                method: method,
+                                headers: headers,
+                                body: bodyPayloads[0],
+                                credentials: 'same-origin'
+                            });
+                            const text = await resp.text();
+                            results.push(`${method} ${ep} -> ${resp.status}: ${text.slice(0, 180)}`);
+                            if (resp.status >= 200 && resp.status < 300) {
+                                return { ok: true, endpoint: ep, status: resp.status, body: text.slice(0, 300), logs: results };
+                            }
+                        } catch (err) {
+                            results.push(`${method} ${ep} -> ERR: ${err.message}`);
+                        }
+                        // 如果返回 404 或 405 则无需尝试 PUT
+                        if (results[results.length - 1].includes('-> 404') || results[results.length - 1].includes('-> 405')) {
+                            break;
+                        }
+                    }
+                }
+                return { ok: false, logs: results };
             })();
             """,
             server_uuid,
             cf_token,
         )
-        print(f"[*] 续期接口响应: {res}")
+        print(f"[*] 扩展 API 探测结果: {res}")
         return res
     except Exception as e:
-        print(f"[!] 调用续期接口异常: {e}")
+        print(f"[!] 调用扩展 API 异常: {e}")
         return None
 
 
 def execute_renew_flow(page, renew_btn):
-    """
-    执行完整的：
-    1. 单次点击 Click to renew 打开 'Unsuspend server' 弹窗
-    2. 在弹窗中点击 'Unsuspend' 按钮（如有 Turnstile 则先过验证）
-    3. 捕获后台 /api/client/extensions/dev.sqidgeon.serverplans/renew 响应
-    """
+    """执行完整的点击 Click to renew -> 处理弹窗/验证 -> 监听网络响应 -> 校验结果流程"""
     reset_cf_tokens(page)
+    inspect_renew_button(page, renew_btn)
 
     try:
         page.listen.start("acorehosting.com")
     except Exception:
         pass
 
-    print(f"[*] 步骤 4.1: 单次点击 '{renew_btn.text}' 打开解封续期弹窗...")
-    click_single_clean(page, renew_btn)
-    time.sleep(2.5)
-    page.get_screenshot(path="modal_opened.png")
+    print(f"[*] 正在点击续期按钮: '{renew_btn.text}' (使用 DOM + React Fiber + 鼠标动作链)...")
+    click_element_robust(page, renew_btn)
+    time.sleep(3)
 
     api_logs = []
-    mutation_api_logs = []
+    mutation_api_logs = []  # 专门记录非 GET 请求 (POST / PUT / PATCH)
     detected_uuid = None
-    discord_error_detected = False
-    clicked_unsuspend = False
     start_time = time.time()
+    clicked_modal_btn = False
+    reclicked_count = 0
 
-    while time.time() - start_time < 30:
-        # 1. 收集网络包
+    while time.time() - start_time < 35:
+        # 1. 收集后台 API 响应包
         try:
             while True:
                 pkt = page.listen.wait(timeout=0.4)
@@ -653,85 +706,98 @@ def execute_renew_flow(page, renew_btn):
                 url_str = pkt.url or ""
                 method_str = (pkt.method or "GET").upper()
 
+                # 从 serverplans/mine 请求 URL 或响应体提取服务器完整 UUID
                 if "server=" in url_str and not detected_uuid:
                     detected_uuid = url_str.split("server=")[-1].split("&")[0]
+                if not detected_uuid and pkt.response and isinstance(pkt.response.body, dict):
+                    srvs = pkt.response.body.get("servers")
+                    if isinstance(srvs, list) and srvs and isinstance(srvs[0], dict):
+                        detected_uuid = srvs[0].get("uuid")
 
-                if any(k in url_str.lower() for k in ["renew", "serverplans", "unsuspend", "verify", "turnstile"]):
+                if any(k in url_str.lower() for k in ["renew", "server", "unsuspend", "billing", "verify", "captcha", "turnstile", "idle"]):
                     status = pkt.response.status if pkt.response else "N/A"
-                    body_str = str(pkt.response.body)[:350] if pkt.response else ""
-                    log_line = f"{method_str} {url_str} -> HTTP {status} | {body_str}"
+                    body_preview = str(pkt.response.body)[:300] if pkt.response else ""
+                    log_line = f"{method_str} {url_str} -> HTTP {status} | {body_preview}"
                     if log_line not in api_logs:
                         print(f"[API] {log_line}")
                         api_logs.append(log_line)
                     if method_str in ("POST", "PUT", "PATCH"):
                         mutation_api_logs.append(log_line)
-                    if "join the required discord server" in body_str.lower():
-                        discord_error_detected = True
         except Exception:
             pass
 
-        if discord_error_detected:
-            break
+        # 2. 检查是否弹出了新标签页
+        if len(page.tab_ids) > 1:
+            latest = page.latest_tab
+            print(f"[*] 检测到新标签页打开: {latest.url}")
+            coords = find_turnstile_coords_via_cdp(latest) or find_turnstile_coords_via_js(latest)
+            if coords:
+                print(f"[*] 点击新标签页中的 Cloudflare 验证框: {coords}")
+                xdotool_click(latest, coords[0], coords[1])
+                time.sleep(4)
 
-        # 2. 检查弹窗内是否有 Cloudflare Turnstile 验证框
+        # 3. 检查当前页面或弹窗中是否出现了真正的 Cloudflare Turnstile 验证框
         coords = find_turnstile_coords_via_cdp(page) or find_turnstile_coords_via_js(page)
         if coords and len(get_cf_token(page)) <= 20:
-            print(f"[*] 检测到弹窗内 Cloudflare Turnstile 验证框，坐标: {coords}，正在点击...")
+            print(f"[*] 检测到续期 Cloudflare Turnstile 验证框，真实坐标: {coords}，正在点击...")
             xdotool_click(page, coords[0], coords[1])
-            time.sleep(3.5)
-            continue
-
-        # 3. 查找并点击弹窗内的 'Unsuspend' 按钮
-        modal_btn = find_modal_confirm_button(page)
-        if modal_btn and is_button_ready(modal_btn):
-            print(f"[*] 步骤 4.2: 找到弹窗确认按钮 '{modal_btn.text}'，正在点击...")
-            click_single_clean(page, modal_btn)
-            clicked_unsuspend = True
             time.sleep(4)
             continue
 
-        # 4. 如果还没打开弹窗（没找到 Unsuspend 按钮）且未触发 POST，补点一次 Click to renew
-        if not clicked_unsuspend and not mutation_api_logs and time.time() - start_time > 5:
+        # 4. 检查是否存在弹窗确认按钮 (Modal / Dialog)
+        modal_btn = find_modal_confirm_button(page)
+        if modal_btn and is_button_ready(modal_btn):
+            print(f"[*] 检测到续期弹窗确认按钮: '{modal_btn.text}'，正在点击...")
+            click_element_robust(page, modal_btn)
+            clicked_modal_btn = True
+            time.sleep(4)
+            continue
+
+        # 5. 如果通过了内联 Turnstile 生成了新 Token，再次点击 Click to renew 提交
+        if len(get_cf_token(page)) > 20 and not clicked_modal_btn and reclicked_count < 2:
             cur_renew_btn = find_renew_button(page)
             if cur_renew_btn and is_button_ready(cur_renew_btn):
-                print("[*] 弹窗尚未打开，补点一次 'Click to renew'...")
-                click_single_clean(page, cur_renew_btn)
-                time.sleep(2.5)
-                modal_btn = find_modal_confirm_button(page)
-                if modal_btn and is_button_ready(modal_btn):
-                    print(f"[*] 找到弹窗确认按钮 '{modal_btn.text}'，正在点击...")
-                    click_single_clean(page, modal_btn)
-                    clicked_unsuspend = True
-                    time.sleep(4)
+                print("[*] Turnstile Token 已生成，再次点击 'Click to renew' 提交续期请求...")
+                click_element_robust(page, cur_renew_btn)
+                reclicked_count += 1
+                time.sleep(4)
                 continue
 
-        # 5. 如果已经触发了 POST 请求，跳出等待检查结果
-        if mutation_api_logs:
+        # 6. 关键改进：只看是否产生了 POST/PUT 请求 (mutation_api_logs)，忽略面板后台的 GET 轮询
+        if time.time() - start_time > 6 and not mutation_api_logs and not coords and not modal_btn and reclicked_count < 2:
+            cur_renew_btn = find_renew_button(page)
+            if cur_renew_btn and is_button_ready(cur_renew_btn):
+                reclicked_count += 1
+                print(f"[*] 未检测到任何 POST 续期请求，正在执行第 {reclicked_count} 次强力补点 'Click to renew'...")
+                click_element_robust(page, cur_renew_btn)
+                time.sleep(4)
+                continue
+
+        # 7. 检查页面上是否已经解除停权或按钮已变为不可点状态
+        cur_renew_btn = find_renew_button(page)
+        if not is_server_suspended_on_page(page) or not cur_renew_btn or not is_button_ready(cur_renew_btn):
+            print("[+] 页面状态已更新：续期已完成或按钮已进入冷却状态！")
             break
 
-        time.sleep(1.5)
+        time.sleep(2)
 
     try:
         page.listen.stop()
     except Exception:
         pass
 
-    # 如果还没有触发 POST 请求，直接调用后台 renew API
-    if not mutation_api_logs and not discord_error_detected:
+    # 如果点击完还是没有触发任何 POST 请求，或者页面仍显示已停权，则启动 API 直连兜底
+    if is_server_suspended_on_page(page):
         cf_tok = get_cf_token(page)
         api_res = try_direct_serverplans_api_renew(page, server_uuid=detected_uuid, cf_token=cf_tok)
         if api_res:
             api_logs.append(f"DIRECT_API: {api_res}")
-            if "join the required discord server" in str(api_res).lower():
-                discord_error_detected = True
 
     notifs = get_page_notifications(page)
     if notifs:
         print(f"[*] 页面提示信息: {notifs}")
-        if any("join the required discord server" in n.lower() for n in notifs):
-            discord_error_detected = True
 
-    return api_logs, notifs, discord_error_detected
+    return api_logs, notifs
 
 
 def main():
@@ -871,7 +937,7 @@ def main():
         print(f"[*] 已进入服务器控制面板: {page.url}")
         page.get_screenshot(path="panel_status.png")
 
-        # ==================== 第四步：点击 Click to renew -> 点击弹窗 Unsuspend ====================
+        # ==================== 第四步：点击 Click to renew 并真实校验续期结果 ====================
         print("[*] 正在查找右上角 Click to renew 按钮...")
         renew_btn = find_renew_button(page)
 
@@ -888,14 +954,8 @@ def main():
             return
 
         print(f"[+] 检测到 '{renew_btn.text}' 可点击！开始执行续期流程...")
-        api_logs, notifs, discord_err = execute_renew_flow(page, renew_btn)
+        api_logs, notifs = execute_renew_flow(page, renew_btn)
         page.get_screenshot(path="after_renew_click.png")
-
-        if discord_err:
-            raise RuntimeError(
-                "AcoreHosting 后台返回 422 拒绝续期：'Join the required Discord server to continue'！"
-                "请登录 AcoreHosting 面板检查 OAuth 绑定的 Discord 账号是否已加入 AcoreHosting 官方 Discord 群组。"
-            )
 
         # 刷新页面以验证服务器端真实状态是否已解除停权
         print("[*] 正在刷新控制面板以核实服务器真实续期状态...")
@@ -910,7 +970,7 @@ def main():
         if still_suspended and still_can_renew:
             detail = f"API记录: {api_logs} | 页面提示: {notifs}"
             raise RuntimeError(
-                f"点击 Unsuspend 后刷新页面，服务器仍处于已停权 (SUSPENDED) 状态！详情: {detail}"
+                f"点击 Click to renew 后刷新页面，服务器仍处于已停权 (SUSPENDED) 状态！详情: {detail}"
             )
 
         # ==================== 第五步：解除停权后自动点击『啟動 / Start』开机 ====================
@@ -921,11 +981,11 @@ def main():
         )
         if start_btn and is_button_ready(start_btn):
             print("[+] 检测到『啟動 / Start』按钮可用，正在点击启动服务器...")
-            click_single_clean(page, start_btn)
+            click_element_robust(page, start_btn)
             time.sleep(5)
             page.get_screenshot(path="server_started.png")
 
-        msg = f"✅ 已成功完成续期并解除停权状态！\n当前面板 URL: {page.url}"
+        msg = f"✅ 已成功完成续期并验证解除停权状态！\n当前面板 URL: {page.url}"
         print(f"[+] {msg}")
         send_tg(msg)
 
